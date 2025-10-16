@@ -112,7 +112,7 @@ python train.py --config config.json
 ### Testing
 
 ```bash
-python test.py --model_path checkpoints/best_model_acc.pth
+python test.py --checkpoint checkpoints/best_model_acc.pth
 ```
 
 ### Visualization
