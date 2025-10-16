@@ -2,6 +2,8 @@
 
 A deep learning experiment for mammography image classification using PyTorch. This project implements various CNN architectures to classify mammography images into different BI-RADS categories.
 
+## Get Powerpoint by this link : https://nycu1-my.sharepoint.com/:p:/g/personal/jhihya_cs14_m365_nycu_edu_tw/EaYA1xxjxK9Hvsuk_nfg-pEB6nFJT0WvUqsaJevbhT1bvQ?e=bhxmeY
+
 ## 📋 Table of Contents
 
 - [Overview](#overview)
