@@ -340,7 +340,7 @@ def main(args):
     # ===== 2. 處理類別不平衡 (可選) =====
     class_weights = None
     sampler = None
-    
+
     if args.use_class_weights:
         print("\n" + "="*70)
         print("2. Handling Class Imbalance")
@@ -353,7 +353,21 @@ def main(args):
         
         class_weights = [total_samples / (num_classes * label_counts[i]) 
                         for i in sorted(label_counts.keys())]
+
+        beta = 0.9999  # 超參數，控制權重強度
         
+        effective_num = [1.0 - beta**label_counts[i] 
+                        for i in sorted(label_counts.keys())]
+        
+        class_weights = [
+            (1.0 - beta) / en 
+            for en in effective_num
+        ]
+        
+        # 歸一化
+        sum_weights = sum(class_weights)
+        class_weights = [w / sum_weights * num_classes for w in class_weights]
+
         print(f"Class counts: {label_counts}")
         print(f"Class weights: {class_weights}")
         
@@ -469,13 +483,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train Mammography Classifier')
     
     # 資料相關
-    parser.add_argument('--train_csv', type=str, default='datasets/train_label.csv',
+    parser.add_argument('--train_csv', type=str, default='datasets/train_labels.csv',
                         help='Training CSV path')
-    parser.add_argument('--train_dir', type=str, default='datasets/train',
+    parser.add_argument('--train_dir', type=str, default='datasets',
                         help='Training data directory')
-    parser.add_argument('--val_csv', type=str, default='datasets/val_label.csv',
+    parser.add_argument('--val_csv', type=str, default='datasets/val_labels.csv',
                         help='Validation CSV path')
-    parser.add_argument('--val_dir', type=str, default='datasets/val',
+    parser.add_argument('--val_dir', type=str, default='datasets',
                         help='Validation data directory')
     parser.add_argument('--img_size', type=int, default=1024,
                         help='Image size')
@@ -496,19 +510,19 @@ def parse_args():
                         help='Freeze backbone weights')
     
     # 訓練相關
-    parser.add_argument('--epochs', type=int, default=50,
+    parser.add_argument('--epochs', type=int, default=100,
                         help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=4,
                         help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-4,
+    parser.add_argument('--lr', type=float, default=1e-5,
                         help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-2,
                         help='Weight decay')
-    parser.add_argument('--min_lr', type=float, default=1e-6,
+    parser.add_argument('--min_lr', type=float, default=1e-7,
                         help='Minimum learning rate')
     parser.add_argument('--use_amp', action='store_true', default=True,
                         help='Use mixed precision training')
-    parser.add_argument('--accumulation_steps', type=int, default=1,
+    parser.add_argument('--accumulation_steps', type=int, default=2,
                         help='Gradient accumulation steps')
     
     # 類別不平衡處理
