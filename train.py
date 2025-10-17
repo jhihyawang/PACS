@@ -269,8 +269,8 @@ class Trainer:
         
         if is_best:
             path = save_dir / f'best_model_{metric}.pth'
-        else:
-            path = save_dir / f'checkpoint_epoch_{epoch+1}.pth'
+        # else:
+        #     path = save_dir / f'checkpoint_epoch_{epoch+1}.pth'
         
         torch.save(checkpoint, path)
     
@@ -485,11 +485,11 @@ def parse_args():
     # 資料相關
     parser.add_argument('--train_csv', type=str, default='datasets/train_labels.csv',
                         help='Training CSV path')
-    parser.add_argument('--train_dir', type=str, default='datasets',
+    parser.add_argument('--train_dir', type=str, default='cropped_datasets',
                         help='Training data directory')
     parser.add_argument('--val_csv', type=str, default='datasets/val_labels.csv',
                         help='Validation CSV path')
-    parser.add_argument('--val_dir', type=str, default='datasets',
+    parser.add_argument('--val_dir', type=str, default='cropped_datasets',
                         help='Validation data directory')
     parser.add_argument('--img_size', type=int, default=1024,
                         help='Image size')
