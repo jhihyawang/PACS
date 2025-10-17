@@ -1,0 +1,17 @@
+# datasets
+/check
+/datasets
+/cropped_datasets
+
+# virtual environment
+.venv
+uv.lock
+.env
+
+# Python
+__pycache__
+.ipynb_checkpoints
+*.pyc
+
+# weights
+*.pth
