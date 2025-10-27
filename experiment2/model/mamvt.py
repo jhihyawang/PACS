@@ -94,7 +94,8 @@ class SwinMidFusionWrapper(nn.Module):
         self.stage3 = self.backbone.layers[2]
         self.stage4 = self.backbone.layers[3]
         self.half_s3 = len(self.stage3.blocks) // 2
-        self.out_channels = self.stage4.dim
+        self.out_channels = getattr(self.stage4, "out_dim", self.stage4.dim * 2)
+
 
     @staticmethod
     def _tokens_to_bchw(x, H, W):
@@ -158,11 +159,9 @@ class SwinMidFusionWrapper(nn.Module):
             t, Hk, Wk = self.forward_single_until_mid(img)
             tokens[k] = t
             H, W = Hk, Wk
-
         # 先轉 [B,H,W,C] 給 Cross-View Fusion
         maps = {k: self._tokens_to_bchw(t, H, W) for k, t in tokens.items()}
         maps = self.fusion(maps)
-
         # ✅ 不要再轉回 tokens，直接給 Swin blocks（因為新版 Swin 吃 [B,H,W,C]）
         feats = {}
         for k, m in maps.items():

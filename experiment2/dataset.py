@@ -132,5 +132,6 @@ def build_exam_transforms(img_size: int = 1536, train: bool = True) -> A.Compose
             "r_cc": "image",
             "l_mlo": "image",
             "r_mlo": "image",
-        }
+        },
+        is_check_shapes=False,   # ✅ 加這行，禁用 shape 檢查
     )
