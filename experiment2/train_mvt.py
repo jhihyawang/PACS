@@ -1,147 +1,237 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Train + Test + Plot for MaMVT (stage-3 mid fusion, six-class, no patch head)
-- 每個 epoch 印出左右乳房 classification report
-- 訓練後自動在 test set 上評估、輸出混淆矩陣與報告（含 breast-level 與 exam-level）
-- 產生訓練曲線圖 (loss/acc/f1)
+Train + Test + Plot for MaMVT (stage-3 mid fusion, six-class)
++ ✅ TensorBoard logging support
 """
-import os, math, json, random, argparse
+import os, json, random, argparse
 from pathlib import Path
 from typing import Dict
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.cuda.amp import autocast, GradScaler
+from torch.utils.tensorboard import SummaryWriter  # ✅ NEW
 from tqdm import tqdm
 import matplotlib.pyplot as plt, seaborn as sns
 from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
 
 from dataset import MammoDataset
 from model.mamvt import MaMVT, MaMVTLoss
+from model.maxvit import MaMVT_MaxViT
+from model.backbone_4_channel import MaMVT_Shared 
 
 VIEWS = ("L-CC", "R-CC", "L-MLO", "R-MLO")
 CLASSES = 6
 SEED = 42
 
+
 def set_seed(seed=SEED):
-    random.seed(seed); np.random.seed(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = True
 
-def exam_logits(outputs:Dict[str,torch.Tensor]):
-    return (outputs['left_logits']+outputs['right_logits'])/2.
 
-def evaluate_breast(model, loader, device, split="VAL", out_dir:Path=None):
-    model.eval(); all_y, all_predL, all_predR = [], [], []
+def get_balanced_sampler(dataset, num_classes=CLASSES):
+    labels = dataset.df["label"].to_numpy(dtype=np.int64)
+    class_counts = np.bincount(labels, minlength=num_classes)
+    print(f"[DATA] Class distribution: {class_counts}")
+
+    class_weights = (1.0 / np.clip(class_counts, 1, None))
+    class_weights = class_weights * (num_classes / class_weights.sum())
+    sample_weights = class_weights[labels]
+
+    sampler = WeightedRandomSampler(
+        weights=torch.as_tensor(sample_weights, dtype=torch.double),
+        num_samples=len(labels),
+        replacement=True
+    )
+    return sampler
+
+
+def evaluate_breast(model, loader, device, criterion=None, split="VAL", out_dir: Path = None):
+    model.eval()
+    all_y, all_predL, all_predR, all_predE = [], [], [], []
+    val_loss = 0.0
+
     with torch.no_grad():
         for batch in tqdm(loader, desc=f"[{split}]", leave=False):
-            for v in VIEWS: batch[v]=batch[v].to(device)
-            y=batch['label'].to(device)
-            out=model(batch)
-            predL=torch.argmax(out['left_logits'],1)
-            predR=torch.argmax(out['right_logits'],1)
-            all_y.append(y.cpu().numpy()); all_predL.append(predL.cpu().numpy()); all_predR.append(predR.cpu().numpy())
-    y_true=np.concatenate(all_y); yL=np.concatenate(all_predL); yR=np.concatenate(all_predR)
-    repL=classification_report(y_true,yL,digits=4)
-    repR=classification_report(y_true,yR,digits=4)
-    print(f"\n[{split}] Left Breast Report:\n{repL}\n[{split}] Right Breast Report:\n{repR}")
-    if out_dir:
-        (out_dir/f"{split.lower()}_left_report.txt").write_text(repL)
-        (out_dir/f"{split.lower()}_right_report.txt").write_text(repR)
-    acc=(accuracy_score(y_true,yL)+accuracy_score(y_true,yR))/2
-    f1m=(f1_score(y_true,yL,average='macro')+f1_score(y_true,yR,average='macro'))/2
-    return {"acc":acc,"f1_macro":f1m}, (y_true, yL, yR)
+            for v in VIEWS:
+                batch[v] = batch[v].to(device)
+            y = batch["label"].to(device)
+            out = model(batch)
 
-def plot_training_curves(log_file:Path, out_dir:Path):
-    if not log_file.exists():
-        print("[WARN] No log.jsonl for plotting."); return
-    epochs, acc, f1m, loss = [], [], [], []
-    for line in log_file.open():
-        obj=json.loads(line); epochs.append(obj['epoch']); acc.append(obj['metrics']['acc']); f1m.append(obj['metrics']['f1_macro']); loss.append(obj['train_loss'])
-    plt.figure(figsize=(10,5))
-    plt.subplot(1,2,1)
-    plt.plot(epochs,loss,label='Train Loss'); plt.xlabel('Epoch'); plt.ylabel('Loss'); plt.grid(True)
-    plt.subplot(1,2,2)
-    plt.plot(epochs,acc,label='Val Acc'); plt.plot(epochs,f1m,label='Val F1_macro'); plt.xlabel('Epoch'); plt.ylabel('Score'); plt.legend(); plt.grid(True)
-    plt.suptitle('Training Curves')
-    plt.tight_layout(); plt.savefig(out_dir/'training_curves.png'); plt.close()
-    print(f"[PLOT] Saved training curves -> {out_dir/'training_curves.png'}")
+            if criterion is not None:
+                loss, _ = criterion(out, y)
+                val_loss += loss.item()
 
-def plot_confusion_matrix(cm,class_names,out_path:Path,title:str):
-    plt.figure(figsize=(8,6)); sns.heatmap(cm,annot=True,fmt='d',cmap='Blues',xticklabels=class_names,yticklabels=class_names)
-    plt.xlabel('Predicted'); plt.ylabel('True'); plt.title(title); plt.tight_layout(); plt.savefig(out_path); plt.close()
+            predL = out["left_logits"].argmax(dim=1)
+            predR = out["right_logits"].argmax(dim=1)
+            predE = out["exam_logits"].argmax(dim=1)
 
-def final_test(model,loader,device,out_dir:Path):
-    print("\n[FINAL TEST]"); metrics,(y_true,yL,yR)=evaluate_breast(model,loader,device,split="TEST",out_dir=out_dir)
-    # Breast-level confusion
-    cmL=confusion_matrix(y_true,yL); cmR=confusion_matrix(y_true,yR); class_names=[str(i) for i in range(CLASSES)]
-    plot_confusion_matrix(cmL,class_names,out_dir/'test_left_confusion_matrix.png','Left Breast Confusion Matrix')
-    plot_confusion_matrix(cmR,class_names,out_dir/'test_right_confusion_matrix.png','Right Breast Confusion Matrix')
-    # Exam-level average
-    model.eval(); all_y, all_pred_exam = [], []
-    with torch.no_grad():
-        for batch in loader:
-            for v in VIEWS: batch[v]=batch[v].to(device)
-            y=batch['label'].to(device)
-            out=model(batch)
-            pred_exam=torch.argmax((out['left_logits']+out['right_logits'])/2,1)
-            all_y.append(y.cpu().numpy()); all_pred_exam.append(pred_exam.cpu().numpy())
-    y_true=np.concatenate(all_y); y_exam=np.concatenate(all_pred_exam)
-    report_exam=classification_report(y_true,y_exam,digits=4)
-    print(f"\n[TEST] Exam-level Classification Report:\n{report_exam}")
-    cm_exam=confusion_matrix(y_true,y_exam)
-    plot_confusion_matrix(cm_exam,class_names,out_dir/'test_exam_confusion_matrix.png','Exam-level Confusion Matrix')
-    print(f"[PLOT] Saved exam-level confusion matrix -> {out_dir/'test_exam_confusion_matrix.png'}")
+            all_y.append(y.cpu().numpy())
+            all_predL.append(predL.cpu().numpy())
+            all_predR.append(predR.cpu().numpy())
+            all_predE.append(predE.cpu().numpy())
+
+    y_true = np.concatenate(all_y)
+    yL, yR, yE = np.concatenate(all_predL), np.concatenate(all_predR), np.concatenate(all_predE)
+
+    repE = classification_report(y_true, yE, digits=4, zero_division=0)
+    print(f"\n[{split}] Exam-level Report:\n{repE}")
+
+    accE = accuracy_score(y_true, yE)
+    f1E = f1_score(y_true, yE, average="macro", zero_division=0)
+    val_loss = val_loss / len(loader) if criterion is not None else 0.0
+
+    return {"acc": accE, "f1_macro": f1E, "loss": val_loss}, (y_true, yL, yR, yE)
+
+
+def plot_confusion_matrix(cm, class_names, out_path: Path, title: str):
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel("Predicted"); plt.ylabel("True"); plt.title(title)
+    plt.tight_layout(); plt.savefig(out_path); plt.close()
+
+
+def final_test(model, loader, device, out_dir: Path):
+    print("\n[FINAL TEST]")
+    metrics, (y_true, yL, yR, yE) = evaluate_breast(model, loader, device, split="TEST", out_dir=out_dir)
+    class_names = [str(i) for i in range(CLASSES)]
+    plot_confusion_matrix(confusion_matrix(y_true, yE), class_names, out_dir / "test_exam_confusion_matrix.png", "Exam-level CM")
+    print(f"[PLOT] Saved confusion matrix -> {out_dir}")
+
 
 def train(args):
-    set_seed(); device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    out_dir=Path(args.out_dir); out_dir.mkdir(parents=True,exist_ok=True)
-    train_ds=MammoDataset(args.train_csv,args.root_dir,args.img_size,train=True)
-    val_ds=MammoDataset(args.val_csv,args.root_dir,args.img_size,train=False)
-    test_ds=MammoDataset(args.test_csv,args.root_dir,args.img_size,train=False) if args.test_csv else None
-    train_loader=DataLoader(train_ds,batch_size=args.batch_size,shuffle=True,num_workers=args.workers,pin_memory=True,drop_last=True)
-    val_loader=DataLoader(val_ds,batch_size=max(1,args.batch_size//2),shuffle=False,num_workers=args.workers,pin_memory=True)
-    test_loader=DataLoader(test_ds,batch_size=max(1,args.batch_size//2),shuffle=False,num_workers=args.workers,pin_memory=True) if test_ds else None
+    set_seed()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=str(out_dir / "tb_logs"))  # ✅ 初始化 TensorBoard writer
 
-    model=MaMVT(backbone=args.backbone,pretrained=True,num_classes=CLASSES).to(device)
-    class_weights=None
-    if args.class_weights and Path(args.class_weights).exists():
-        w=torch.tensor(np.load(args.class_weights),dtype=torch.float32); class_weights=w.to(device)
-    criterion=MaMVTLoss(w_view=1.0,w_breast=1.0,class_weights=class_weights)
-    opt=optim.AdamW(model.parameters(),lr=args.lr,weight_decay=args.weight_decay)
-    scaler=GradScaler(enabled=not args.no_amp)
-    best_f1=-1; best_path=out_dir/'best.pt'
+    train_ds = MammoDataset(args.train_csv, args.root_dir, args.img_size, train=True, in_chans=args.in_chans)
+    val_ds   = MammoDataset(args.val_csv, args.root_dir, args.img_size, train=False, in_chans=args.in_chans)
+    test_ds  = MammoDataset(args.test_csv, args.root_dir, args.img_size, train=False, in_chans=args.in_chans) if args.test_csv else None
 
-    for epoch in range(1,args.epochs+1):
-        model.train(); pbar=tqdm(train_loader,desc=f"[TRAIN] {epoch}/{args.epochs}"); run_loss=0.
-        for i,batch in enumerate(pbar):
-            for v in VIEWS: batch[v]=batch[v].to(device)
-            y=batch['label'].to(device); opt.zero_grad(set_to_none=True)
+    val_loader = DataLoader(val_ds, batch_size=max(1, args.batch_size // 2), shuffle=False,
+                            num_workers=args.workers, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=max(1, args.batch_size // 2), shuffle=False,
+                             num_workers=args.workers, pin_memory=True) if test_ds else None
+
+    if args.structure == "maxvit":
+        model = MaMVT_MaxViT(
+            backbone=args.backbone,
+            pretrained=True,
+            num_classes=CLASSES,
+            in_chans=args.in_chans
+        ).to(device)
+    elif args.structure == "mamvt":
+        model = MaMVT(backbone=args.backbone, pretrained=True, num_classes=CLASSES,
+                    in_chans=args.in_chans).to(device)
+    else:
+        model = MaMVT_Shared(backbone=args.backbone, pretrained=True, num_classes=CLASSES,
+                              in_chans=args.in_chans).to(device)
+
+    criterion = MaMVTLoss(w_view=1.0, w_breast=1.0, w_exam=1.0,
+                          class_weights=None, use_focal=(args.loss == "focal"),
+                          label_smoothing=args.label_smoothing)
+    print(f"[TRAIN] Using exam-level loss (w_exam=1.0)")
+
+    if args.optim == "sgd":
+        opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    scaler = GradScaler(enabled=not args.no_amp)
+    best_f1, best_path = -1, out_dir / "best.pt"
+
+    for epoch in range(1, args.epochs + 1):
+        train_sampler = get_balanced_sampler(train_ds, CLASSES)
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler,
+                                  num_workers=args.workers, pin_memory=True, drop_last=False)
+
+        model.train()
+        pbar = tqdm(train_loader, desc=f"[TRAIN] {epoch}/{args.epochs}")
+        run_loss = 0.0
+        all_train_y, all_train_predE = [], []
+
+        for i, batch in enumerate(pbar):
+            for v in VIEWS:
+                batch[v] = batch[v].to(device)
+            y = batch["label"].to(device)
+
+            opt.zero_grad(set_to_none=True)
             with autocast(enabled=not args.no_amp):
-                out=model(batch); loss,stats=criterion(out,y)
-            scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
-            run_loss+=stats['loss']; pbar.set_postfix({"loss":f"{run_loss/(i+1):.4f}"})
-        val_metrics,_=evaluate_breast(model,val_loader,device,split="VAL",out_dir=out_dir)
-        log={"epoch":epoch,"train_loss":run_loss/len(train_loader),"metrics":val_metrics}
-        (out_dir/'log.jsonl').open('a').write(json.dumps(log)+'\n')
-        if val_metrics['f1_macro']>best_f1:
-            best_f1=val_metrics['f1_macro']; torch.save(model.state_dict(),best_path)
-            print(f"[CKPT] best model saved (f1_macro={best_f1:.4f})")
+                out = model(batch)
+                loss, stats = criterion(out, y)
 
-    plot_training_curves(out_dir/'log.jsonl',out_dir)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            scaler.step(opt); scaler.update()
+            run_loss += stats["loss"]
+
+            predE = out["exam_logits"].argmax(dim=1)
+            all_train_y.append(y.cpu().numpy())
+            all_train_predE.append(predE.cpu().numpy())
+
+        train_loss = run_loss / len(train_loader)
+        train_acc = accuracy_score(np.concatenate(all_train_y), np.concatenate(all_train_predE))
+        val_metrics, _ = evaluate_breast(model, val_loader, device, criterion=criterion, split="VAL", out_dir=out_dir)
+        val_acc, val_f1, val_loss = val_metrics["acc"], val_metrics["f1_macro"], val_metrics["loss"]
+
+        # ✅ TensorBoard logging
+        writer.add_scalar("Loss/train", train_loss, epoch)
+        writer.add_scalar("Loss/val", val_loss, epoch)
+        writer.add_scalar("Accuracy/train", train_acc, epoch)
+        writer.add_scalar("Accuracy/val", val_acc, epoch)
+        writer.add_scalar("F1_macro/val", val_f1, epoch)
+        for k in ["loss_view", "loss_breast", "loss_exam"]:
+            if k in stats:
+                writer.add_scalar(f"Loss/{k}", stats[k], epoch)
+
+        log = {"epoch": epoch, "train_loss": train_loss, "metrics": val_metrics}
+        (out_dir / "log.jsonl").open("a").write(json.dumps(log) + "\n")
+
+        print(f"[EPOCH {epoch}] Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
+              f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Val F1: {val_f1:.4f}")
+
+        if val_f1 > best_f1:
+            best_f1 = val_f1
+            torch.save(model.state_dict(), best_path)
+            print(f"[CKPT] Best model saved (f1_macro={best_f1:.4f})")
+
+    writer.close()  # ✅ 關閉 TensorBoard writer
+
     if test_loader:
-        model.load_state_dict(torch.load(best_path,map_location=device))
-        final_test(model,test_loader,device,out_dir)
+        model.load_state_dict(torch.load(best_path, map_location=device))
+        final_test(model, test_loader, device, out_dir)
 
-if __name__=='__main__':
-    ap=argparse.ArgumentParser()
-    ap.add_argument('--train_csv',required=True); ap.add_argument('--val_csv',required=True); ap.add_argument('--test_csv',default='')
-    ap.add_argument('--root_dir',default='.'); ap.add_argument('--out_dir',default='runs/mamvt_stage3')
-    ap.add_argument('--backbone',default='swin_base_patch4_window12_384'); ap.add_argument('--img_size',type=int,default=1536)
-    ap.add_argument('--batch_size',type=int,default=4); ap.add_argument('--epochs',type=int,default=30)
-    ap.add_argument('--lr',type=float,default=1e-4); ap.add_argument('--weight_decay',type=float,default=1e-4)
-    ap.add_argument('--workers',type=int,default=6); ap.add_argument('--no_amp',action='store_true'); ap.add_argument('--class_weights',default='')
-    args=ap.parse_args(); train(args)
+# ===============================================================
+# CLI
+# ===============================================================
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--train_csv", required=True)
+    ap.add_argument("--val_csv", required=True)
+    ap.add_argument("--test_csv", default="")
+    ap.add_argument("--root_dir", default=".")
+    ap.add_argument("--out_dir", default="runs/mamvt_stage3_exam")
+    ap.add_argument("--structure", type=str, default="mamvt", choices=["mamvt", "maxvit", "4channel"])
+    ap.add_argument("--backbone", default="swin_base_patch4_window12_384_in22k")
+    ap.add_argument("--img_size", type=int, default=1536)
+    ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--epochs", type=int, default=60)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-3)
+    ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--no_amp", action="store_true")
+    ap.add_argument("--loss", type=str, default="focal", choices=["focal", "ce"])
+    ap.add_argument("--label_smoothing", type=float, default=0.2)
+    ap.add_argument("--in_chans", type=int, default=1, choices=[1, 3])
+    ap.add_argument("--optim", type=str, default="sgd", choices=["sgd", "adamw"])
+    args = ap.parse_args()
+    train(args)
