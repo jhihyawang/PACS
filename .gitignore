@@ -10,6 +10,8 @@ wheels/
 .venv
 .vscode/
 
-#data/
+data/
 processed_datasets/
 exp_results/
+experiments/
+csv/
